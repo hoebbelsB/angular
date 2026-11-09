@@ -1,0 +1,159 @@
+import * as mainR from './main/list_reconciliation';
+import * as prR from './pr/list_reconciliation';
+
+type Item = {id: number; label: string};
+const item = (id: number): Item => ({id, label: `item ${id}`});
+const range = (n: number, off = 0) => Array.from({length: n}, (_, i) => item(i + off));
+const seeded = (seed: number) => (n: number) =>
+  Math.floor(((seed = (seed * 16807) % 2147483647) / 2147483647) * n);
+const shuffle = <T>(a: T[], rnd: (n: number) => number) => {
+  a = a.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = rnd(i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
+const relocate = <T>(a: T[], c: number, rnd: (n: number) => number) => {
+  a = a.slice();
+  for (let k = 0; k < c; k++) a.splice(rnd(a.length), 0, ...a.splice(rnd(a.length), 1));
+  return a;
+};
+type Scenario = {
+  base?: (a: Item[], r: (n: number) => number) => Item[];
+  next: (a: Item[], r: (n: number) => number) => Item[];
+};
+const SCENARIOS: Record<string, Scenario> = {
+  append: {next: (a) => [...a, item(1e6)]},
+  prepend: {next: (a) => [item(1e6), ...a]},
+  insertMiddle: {
+    next: (a) => {
+      const m = a.length >> 1;
+      return [...a.slice(0, m), item(1e6), ...a.slice(m)];
+    },
+  },
+  removeFirst: {next: (a) => a.slice(1)},
+  removeMiddle: {next: (a) => a.filter((_, i) => i !== a.length >> 1)},
+  slidingWindow: {next: (a) => [...a.slice(1), item(1e6)]},
+  swap: {
+    next: (a) => {
+      const b = a.slice();
+      const j = b.length - 10;
+      [b[10], b[j]] = [b[j], b[10]];
+      return b;
+    },
+  },
+  moveOne: {
+    next: (a) => {
+      const b = a.slice();
+      b.splice(b.length - 10, 0, ...b.splice(10, 1));
+      return b;
+    },
+  },
+  relocate10: {next: (a, r) => relocate(a, 10, r)},
+  sortNearlySorted: {
+    base: (a, r) => relocate(a, Math.ceil(a.length / 20), r),
+    next: (a) => a.slice().sort((x, y) => x.id - y.id),
+  },
+  shuffle: {next: (a, r) => shuffle(a, r)},
+  reverse: {next: (a) => a.slice().reverse()},
+  updateEvery10th: {next: (a) => a.map((x, i) => (i % 10 === 0 ? {...x} : x))},
+  updateAll: {next: (a) => a.map((x) => ({...x}))},
+  filterHalf: {next: (a) => a.filter((x) => x.id % 2 === 0)},
+  replaceAll: {next: (a) => range(a.length, 1e6)},
+};
+let trackCalls = 0;
+const trackBy = (_: number, i: Item) => (trackCalls++, i.id);
+
+function lc(R: any, values: Item[]) {
+  // models LiveCollectionLContainerImpl: array splices for attach/detach, at() reads the context
+  return new (class extends R.LiveCollection<any, Item> {
+    e = values.map((value) => ({value}));
+    detached = new Set<any>();
+    c = {
+      at: 0,
+      attach: 0,
+      detach: 0,
+      moves: 0,
+      create: 0,
+      destroy: 0,
+      update: 0,
+      peak: values.length,
+    };
+    get length() {
+      return this.e.length;
+    }
+    at(i: number) {
+      this.c.at++;
+      return this.e[i].value;
+    }
+    attach(i: number, x: any) {
+      this.c.attach++;
+      if (this.detached.delete(x)) this.c.moves++;
+      this.e.splice(i, 0, x);
+      this.c.peak = Math.max(this.c.peak, this.e.length + this.detached.size);
+    }
+    detach(i: number) {
+      this.c.detach++;
+      const x = this.e.splice(i, 1)[0];
+      this.detached.add(x);
+      return x;
+    }
+    create(_: number, value: Item) {
+      this.c.create++;
+      return {value};
+    }
+    destroy(x: any) {
+      this.detached.delete(x);
+      this.c.destroy++;
+    }
+    updateValue(i: number, v: Item) {
+      this.c.update++;
+      this.e[i].value = v;
+    }
+  })();
+}
+const median = (xs: number[]) => {
+  const s = xs.slice().sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+};
+function time(R: any, base: Item[], next: Item[], samples: number) {
+  for (let i = 0; i < 20; i++) R.reconcile(lc(R, base), next, trackBy, null);
+  const xs: number[] = [];
+  for (let i = 0; i < samples; i++) {
+    const l = lc(R, base);
+    const t0 = performance.now();
+    R.reconcile(l, next, trackBy, null);
+    xs.push((performance.now() - t0) * 1000);
+  }
+  return median(xs);
+}
+const N = Number(process.argv[2] ?? 1000),
+  SAMPLES = Number(process.argv[3] ?? 101);
+console.log(`n=${N}, ${SAMPLES} samples, median, node ${process.version}, ngDevMode=false\n`);
+console.log(
+  '| scenario | moves main → PR | trackBy calls main → PR | at() main → PR | updateValue main → PR | peak views main → PR | reconcile µs main → PR |',
+);
+console.log('| --- | ---: | ---: | ---: | ---: | ---: | ---: |');
+for (const [name, sc] of Object.entries(SCENARIOS)) {
+  const rnd = seeded(1);
+  const base = sc.base ? sc.base(range(N), rnd) : range(N);
+  const next = sc.next(base, rnd);
+  const r: any = {};
+  for (const [k, R] of [
+    ['main', mainR],
+    ['pr', prR],
+  ] as const) {
+    trackCalls = 0;
+    const l = lc(R, base);
+    R.reconcile(l, next, trackBy, null);
+    if (l.e.length !== next.length || !l.e.every((x: any, i: number) => x.value === next[i]))
+      throw new Error(`${k} ${name} wrong result`);
+    r[k] = {...l.c, track: trackCalls, us: time(R, base, next, SAMPLES)};
+  }
+  const f = (x: number) => (x >= 100 ? x.toFixed(0) : x.toFixed(1));
+  console.log(
+    `| ${name} | ${r.main.moves} → ${r.pr.moves} | ${r.main.track} → ${r.pr.track} | ${r.main.at} → ${r.pr.at} | ${r.main.update} → ${r.pr.update} | ${r.main.peak} → ${r.pr.peak} | ${f(r.main.us)} → ${f(r.pr.us)} |`,
+  );
+}

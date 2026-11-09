@@ -1,0 +1,16 @@
+load("@rules_angular//src/optimization:index.bzl", "optimize_angular_app")
+
+package(default_visibility = ["//modules/benchmarks:__subpackages__"])
+
+optimize_angular_app(
+    name = "bundles",
+    srcs = glob(["*.ts"]) + ["index.html"],
+    deps = [
+        "//modules:node_modules/@angular/build",
+        "//modules:node_modules/@angular/common",
+        "//modules:node_modules/@angular/core",
+        "//modules:node_modules/@angular/platform-browser",
+        "//modules:node_modules/rxjs",
+        "//modules:node_modules/tslib",
+    ],
+)
