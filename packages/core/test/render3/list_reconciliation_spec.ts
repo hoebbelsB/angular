@@ -206,10 +206,11 @@ describe('list reconciliation', () => {
 
       expect(pc.getCollection()).toEqual(['a', 'b', 'c']);
       expect(pc.getLogs()).toEqual([
+        // 'x1' is parked (the next live item is the next new item), then destroyed
         ['detach', 1, 'x1'],
+        ['destroy', 'x1'],
         ['detach', 2, 'x2'],
         ['destroy', 'x2'],
-        ['destroy', 'x1'],
       ]);
     });
 
@@ -232,19 +233,16 @@ describe('list reconciliation', () => {
 
       expect(pc.getCollection()).toEqual(['s2', 'a', 'b', 'c', 'e2']);
       expect(pc.getLogs()).toEqual([
-        // item gets created at index 0 since we know it is not in the old array
+        // removed items are destroyed first (from the end)
+        ['detach', 4, 'e1'],
+        ['destroy', 'e1'],
+        ['detach', 0, 's1'],
+        ['destroy', 's1'],
+        // 'a', 'b', 'c' stay in place, new items are created around them
         ['create', 0, 's2'],
         ['attach', 0, 's2'],
-        // item at index 1 gets detached since it is not part of the new collection
-        ['detach', 1, 's1'],
-        // we are on the fast path again, skipping 'a', 'b', 'c'
-        // item gets created at index 4 since we know it is not in the old array
         ['create', 4, 'e2'],
         ['attach', 4, 'e2'],
-        // the rest gets detached / destroyed
-        ['detach', 5, 'e1'],
-        ['destroy', 'e1'],
-        ['destroy', 's1'],
       ]);
     });
 
@@ -276,7 +274,8 @@ describe('list reconciliation', () => {
 
       expect(pc.getCollection()).toEqual([{k: 2}, {k: 3}, {k: 1}, {k: 1}, {k: 1}, {k: 4}]);
       expect(pc.getLogs()).toEqual([
-        ['detach', 0, {k: 1}],
+        // items not on the LIS are detached from the end
+        ['detach', 1, {k: 1}],
         ['detach', 0, {k: 1}],
         ['attach', 2, {k: 1}],
         ['attach', 3, {k: 1}],
@@ -334,16 +333,15 @@ describe('list reconciliation', () => {
       ]);
     });
 
-    it('should detect (slow) moves to the front', () => {
+    it('should detect moves to the front', () => {
       const pc = new LoggingLiveCollection(['a', 'b', 'c', 'd']);
       reconcile(pc, new Set(['a', 'd', 'b', 'c']), trackByIdentity, null);
 
       expect(pc.getCollection()).toEqual(['a', 'd', 'b', 'c']);
+      // iterables are reconciled like arrays: a single move
       expect(pc.getLogs()).toEqual([
-        ['detach', 1, 'b'],
-        ['detach', 1, 'c'],
-        ['attach', 2, 'b'],
-        ['attach', 3, 'c'],
+        ['detach', 3, 'd'],
+        ['attach', 1, 'd'],
       ]);
     });
 
@@ -524,6 +522,191 @@ describe('list reconciliation', () => {
         {index: 2, implicit: {k: 1, v: 'bb'}},
         {index: 3, implicit: {k: 2, v: 'cc'}},
       ]);
+    });
+  });
+
+  describe('minimal moves', () => {
+    interface Entry<V> {
+      value: V;
+      id: number;
+    }
+
+    /** Array backed live collection, counting the operations reconcile performs. */
+    class CountingLiveCollection<V> extends LiveCollection<Entry<V>, V> {
+      entries: Entry<V>[];
+      ops = {create: 0, destroy: 0, moved: 0};
+      peak: number;
+      private nextId = 0;
+      private detached = new Set<Entry<V>>();
+
+      constructor(values: V[]) {
+        super();
+        this.entries = values.map((value) => ({value, id: this.nextId++}));
+        this.peak = this.entries.length;
+      }
+      override get length() {
+        return this.entries.length;
+      }
+      override at(index: number) {
+        return this.entries[index].value;
+      }
+      override attach(index: number, entry: Entry<V>) {
+        if (this.detached.delete(entry)) {
+          this.ops.moved++;
+        }
+        this.entries.splice(index, 0, entry);
+        this.peak = Math.max(this.peak, this.entries.length + this.detached.size);
+      }
+      override detach(index: number) {
+        const [entry] = this.entries.splice(index, 1);
+        this.detached.add(entry);
+        return entry;
+      }
+      override create(_: number, value: V) {
+        this.ops.create++;
+        return {value, id: this.nextId++};
+      }
+      override destroy(entry: Entry<V>) {
+        expect(this.detached.delete(entry)).toBe(true);
+        this.ops.destroy++;
+      }
+      override updateValue(index: number, value: V) {
+        this.entries[index].value = value;
+      }
+      values() {
+        return this.entries.map((e) => e.value);
+      }
+    }
+
+    interface Item {
+      id: number;
+    }
+    const trackById = (_: number, item: Item) => item.id;
+
+    /** minimum number of moves: retained items not on the LIS of their new positions */
+    function minMoves(prev: Item[], next: Item[]): number {
+      const prevIdx = new Map(prev.map((item, i) => [item.id, i]));
+      const seq = next.map((item) => prevIdx.get(item.id)).filter((i) => i !== undefined);
+      const tails: number[] = [];
+      for (const x of seq) {
+        let lo = 0;
+        let hi = tails.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          if (tails[mid] < x!) lo = mid + 1;
+          else hi = mid;
+        }
+        tails[lo] = x!;
+      }
+      return seq.length - tails.length;
+    }
+
+    function random(seed: number) {
+      return (n: number) => {
+        seed = (seed * 16807) % 2147483647;
+        return Math.floor((seed / 2147483647) * n);
+      };
+    }
+
+    function shuffle<T>(arr: T[], rnd: (n: number) => number): T[] {
+      const a = arr.slice();
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = rnd(i + 1);
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    }
+
+    const range = (n: number, offset = 0): Item[] =>
+      Array.from({length: n}, (_, i) => ({id: i + offset}));
+
+    it('should not move an item that can stay when the live end is the new start', () => {
+      const live = new CountingLiveCollection<string>(['6', '4']);
+      reconcile(live, ['4', '0'], trackByIdentity, null);
+      expect(live.values()).toEqual(['4', '0']);
+      expect(live.ops).toEqual({create: 1, destroy: 1, moved: 0});
+    });
+
+    it('should move a single relocated item once', () => {
+      const items = range(100);
+      const next = items.slice();
+      next.splice(80, 0, ...next.splice(10, 1));
+      const live = new CountingLiveCollection<Item>(items);
+      reconcile(live, next, trackById, null);
+      expect(live.values()).toEqual(next);
+      expect(live.ops.moved).toBe(1);
+    });
+
+    it('should move only the minimum number of items for scattered relocations', () => {
+      const rnd = random(42);
+      const items = range(1000);
+      const next = items.slice();
+      for (let i = 0; i < 10; i++) {
+        next.splice(rnd(next.length), 0, ...next.splice(rnd(next.length), 1));
+      }
+      const live = new CountingLiveCollection<Item>(items);
+      reconcile(live, next, trackById, null);
+      expect(live.values()).toEqual(next);
+      expect(live.ops.moved).toBe(minMoves(items, next));
+      expect(live.ops.moved).toBeLessThanOrEqual(10);
+    });
+
+    it('should destroy removed items before creating new ones', () => {
+      const live = new CountingLiveCollection<Item>(range(100));
+      reconcile(live, range(100, 1000), trackById, null);
+      expect(live.ops).toEqual({create: 100, destroy: 100, moved: 0});
+      expect(live.peak).toBeLessThanOrEqual(101);
+    });
+
+    it('should reconcile random changes of unique keys with the minimum number of moves', () => {
+      const rnd = random(7);
+      for (let run = 0; run < 3000; run++) {
+        const universe = range(20);
+        const prev = shuffle(universe, rnd).slice(0, rnd(21));
+        const next = shuffle(universe, rnd)
+          .slice(0, rnd(21))
+          // some values change identity, keeping their key
+          .map((item) => (rnd(2) ? item : {...item}));
+        for (const asIterable of [false, true]) {
+          const live = new CountingLiveCollection<Item>(prev);
+          const ids = new Map(live.entries.map((e) => [e.value.id, e.id]));
+          reconcile(live, asIterable ? new Set(next) : next, trackById, null);
+
+          expect(live.values()).toEqual(next);
+          live.values().forEach((value, i) => expect(value).toBe(next[i]));
+          // retained keys keep their entry
+          for (const entry of live.entries) {
+            if (ids.has(entry.value.id)) {
+              expect(entry.id).toBe(ids.get(entry.value.id)!);
+            }
+          }
+          expect(live.ops.create).toBe(next.filter((n) => !prev.some((p) => p.id === n.id)).length);
+          expect(live.ops.moved).toBe(minMoves(prev, next));
+        }
+      }
+    });
+
+    it('should reconcile random changes with duplicated keys', () => {
+      spyOn(console, 'warn');
+      const rnd = random(11);
+      for (let run = 0; run < 3000; run++) {
+        const prev = Array.from({length: rnd(8)}, () => rnd(4));
+        const next = Array.from({length: rnd(8)}, () => rnd(4));
+        const live = new CountingLiveCollection<number>(prev);
+        reconcile(live, next, trackByIdentity, null);
+        expect(live.values()).toEqual(next);
+        // as many entries are kept as the keys allow
+        let retained = 0;
+        const counts = new Map<number, number>();
+        prev.forEach((v) => counts.set(v, (counts.get(v) ?? 0) + 1));
+        next.forEach((v) => {
+          if ((counts.get(v) ?? 0) > 0) {
+            counts.set(v, counts.get(v)! - 1);
+            retained++;
+          }
+        });
+        expect(live.ops.create).toBe(next.length - retained);
+      }
     });
   });
 });

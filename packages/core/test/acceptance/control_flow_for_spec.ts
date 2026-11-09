@@ -215,7 +215,6 @@ describe('control flow - for', () => {
       const fixture = TestBed.createComponent(TestComponent);
       await fixture.whenStable();
       expect(fixture.nativeElement.textContent).toBe('abc');
-      expect(offsetReads).toBeGreaterThan(0);
 
       const prevReads = offsetReads;
       // explicitly modify the DOM text node to make sure that the list reconciliation algorithm
@@ -246,6 +245,10 @@ describe('control flow - for', () => {
       }
 
       const fixture = TestBed.createComponent(TestComponent);
+      fixture.detectChanges();
+      // the initial render doesn't need to compare keys, reorder to invoke the tracking function
+      fixture.componentInstance.items = ['b', 'a'];
+      fixture.componentRef.injector.get(ChangeDetectorRef).markForCheck();
       fixture.detectChanges();
       expect([...calls].sort()).toEqual(['a:hello', 'b:hello']);
     });
@@ -278,6 +281,10 @@ describe('control flow - for', () => {
 
       const fixture = TestBed.createComponent(TestComponent);
       fixture.detectChanges();
+      // the initial render doesn't need to compare keys, reorder to invoke the tracking function
+      fixture.componentInstance.items = ['b', 'a'];
+      fixture.componentRef.injector.get(ChangeDetectorRef).markForCheck();
+      fixture.detectChanges();
       expect([...calls].sort()).toEqual(['a:hello', 'b:hello']);
     });
 
@@ -299,6 +306,10 @@ describe('control flow - for', () => {
       }
 
       const fixture = TestBed.createComponent(TestComponent);
+      fixture.detectChanges();
+      // the initial render doesn't need to compare keys, reorder to invoke the tracking function
+      fixture.componentInstance.items = ['b', 'a'];
+      fixture.componentRef.injector.get(ChangeDetectorRef).markForCheck();
       fixture.detectChanges();
       expect(context).toBe(fixture.componentInstance);
     });
