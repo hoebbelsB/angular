@@ -1,6 +1,6 @@
 /**
  * @for reconciliation benchmark: A/B the list reconciler on scenario updates.
- * Exposes `window.__forBench.runAll(n, reps)` for a CDP driver. Every rep is validated against the DOM.
+ * Exposes `window.__forBench.runAll(n, reps, 'time' | 'mem')` for a CDP driver. Every rep is validated against the DOM.
  */
 import {
   ApplicationRef,
@@ -197,12 +197,51 @@ bootstrapApplication(ForBenchComponent).then((appRef: ApplicationRef) => {
     return {scenario: name, n, domAdded: added, domRemoved: removed, tick, frame};
   }
 
+  // V8 heap per update. Needs Chrome with --enable-precise-memory-info and
+  // --js-flags="--expose-gc --min-semi-space-size=.. --max-semi-space-size=.." so no GC runs inside the
+  // tick: then usedJSHeapSize after - before = bytes allocated by the update (incl. garbage).
+  // retained = heap after GC with `next` rendered - heap after GC with `base` rendered. GC runs twice:
+  // after a single gc() up to ~50 KB of garbage from the previous update can survive until the next one.
+  // Blink/Oilpan (DOM node) memory is not in usedJSHeapSize.
+  async function mem(name: string, n: number, reps: number) {
+    const gc = () => ((window as any).gc(), (window as any).gc());
+    const heap = () => (performance as any).memory.usedJSHeapSize as number;
+    const {base, next} = data(name, n);
+    const alloc: number[] = [];
+    const retained: number[] = [];
+    // heap after GC with `base` rendered, per rep: grows if updates leak
+    const baseline: number[] = [];
+    for (let rep = -2; rep < reps; rep++) {
+      render([]);
+      render(base);
+      check(base, name);
+      await nextFrame();
+      gc();
+      const h0 = heap();
+      render(next);
+      const h1 = heap();
+      check(next, name);
+      await nextFrame();
+      gc();
+      const h2 = heap();
+      if (rep >= 0) {
+        alloc.push(h1 - h0);
+        retained.push(h2 - h0);
+        baseline.push(h0);
+      }
+    }
+    render([]);
+    return {scenario: name, n, alloc, retained, baseline};
+  }
+
   (window as any).__forBench = {
     scenarios: Object.keys(SCENARIOS),
     run,
-    async runAll(n: number, reps: number) {
+    async runAll(n: number, reps: number, mode: 'time' | 'mem' = 'time') {
       const results = [];
-      for (const name of Object.keys(SCENARIOS)) results.push(await run(name, n, reps));
+      for (const name of Object.keys(SCENARIOS)) {
+        results.push(await (mode === 'mem' ? mem : run)(name, n, reps));
+      }
       return {crossOriginIsolated: (window as any).crossOriginIsolated, results};
     },
   };

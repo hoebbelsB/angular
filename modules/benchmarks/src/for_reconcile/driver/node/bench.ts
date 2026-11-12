@@ -1,3 +1,6 @@
+// time: node bench.mjs <n> <samples>
+// mem:  node --expose-gc --min-semi-space-size=256 --max-semi-space-size=256 bench.mjs <n> <samples>
+import {PerformanceObserver, constants} from 'node:perf_hooks';
 import * as mainR from './main/list_reconciliation';
 import * as prR from './pr/list_reconciliation';
 
@@ -66,10 +69,12 @@ let trackCalls = 0;
 const trackBy = (_: number, i: Item) => (trackCalls++, i.id);
 
 function lc(R: any, values: Item[]) {
-  // models LiveCollectionLContainerImpl: array splices for attach/detach, at() reads the context
+  // models LiveCollectionLContainerImpl: array splices for attach/detach (like removeFromArray /
+  // addToArray), at() reads the context. Detached state is a flag, so the harness itself does not
+  // allocate per move beyond what splice does in Angular too.
   return new (class extends R.LiveCollection<any, Item> {
-    e = values.map((value) => ({value}));
-    detached = new Set<any>();
+    e = values.map((value) => ({value, d: false}));
+    nd = 0;
     c = {
       at: 0,
       attach: 0,
@@ -89,22 +94,23 @@ function lc(R: any, values: Item[]) {
     }
     attach(i: number, x: any) {
       this.c.attach++;
-      if (this.detached.delete(x)) this.c.moves++;
+      if (x.d) (this.c.moves++, (x.d = false), this.nd--);
       this.e.splice(i, 0, x);
-      this.c.peak = Math.max(this.c.peak, this.e.length + this.detached.size);
+      this.c.peak = Math.max(this.c.peak, this.e.length + this.nd);
     }
     detach(i: number) {
       this.c.detach++;
       const x = this.e.splice(i, 1)[0];
-      this.detached.add(x);
+      x.d = true;
+      this.nd++;
       return x;
     }
     create(_: number, value: Item) {
       this.c.create++;
-      return {value};
+      return {value, d: false};
     }
     destroy(x: any) {
-      this.detached.delete(x);
+      if (x.d) (this.nd--, (x.d = false));
       this.c.destroy++;
     }
     updateValue(i: number, v: Item) {
@@ -129,11 +135,45 @@ function time(R: any, base: Item[], next: Item[], samples: number) {
   }
   return median(xs);
 }
+// Memory mode (node --expose-gc ...): bytes allocated by one reconcile() call, incl. garbage, the
+// splice arrays and the created view stubs. Relies on a young generation large enough that no GC runs
+// inside the call; a minor GC observed during the measurement aborts the run. Timing runs without
+// these flags so GC behaves as by default.
+const gc = (globalThis as any).gc as (() => void) | undefined;
+const MEM = !!gc;
+let minorGCs = 0;
+if (MEM) {
+  new PerformanceObserver((l) => {
+    for (const e of l.getEntries())
+      if ((e as any).detail?.kind === constants.NODE_PERFORMANCE_GC_MINOR) minorGCs++;
+  }).observe({entryTypes: ['gc']});
+}
+const used = () => process.memoryUsage().heapUsed;
+const flushGC = () => new Promise((r) => setTimeout(r, 0));
+async function bytes(R: any, base: Item[], next: Item[], samples: number) {
+  const xs: number[] = [];
+  const empty: number[] = [];
+  for (let i = -5; i < samples; i++) {
+    const l = lc(R, base);
+    gc!();
+    const h0 = used();
+    const h1 = used();
+    R.reconcile(l, next, trackBy, null);
+    const h2 = used();
+    if (i >= 0) (empty.push(h1 - h0), xs.push(h2 - h1));
+  }
+  await flushGC();
+  if (minorGCs) throw new Error('minor GC during allocation measurement, raise semi-space size');
+  return median(xs) - median(empty);
+}
 const N = Number(process.argv[2] ?? 1000),
   SAMPLES = Number(process.argv[3] ?? 101);
-console.log(`n=${N}, ${SAMPLES} samples, median, node ${process.version}, ngDevMode=false\n`);
+const last = MEM ? 'allocated KB main → PR' : 'reconcile µs main → PR';
 console.log(
-  '| scenario | moves main → PR | trackBy calls main → PR | at() main → PR | updateValue main → PR | peak views main → PR | reconcile µs main → PR |',
+  `n=${N}, ${SAMPLES} samples, median, node ${process.version}, ngDevMode=false${MEM ? ', KB = bytes allocated per reconcile() call' : ''}\n`,
+);
+console.log(
+  `| scenario | moves main → PR | trackBy calls main → PR | at() main → PR | updateValue main → PR | peak views main → PR | ${last} |`,
 );
 console.log('| --- | ---: | ---: | ---: | ---: | ---: | ---: |');
 for (const [name, sc] of Object.entries(SCENARIOS)) {
@@ -150,10 +190,14 @@ for (const [name, sc] of Object.entries(SCENARIOS)) {
     R.reconcile(l, next, trackBy, null);
     if (l.e.length !== next.length || !l.e.every((x: any, i: number) => x.value === next[i]))
       throw new Error(`${k} ${name} wrong result`);
-    r[k] = {...l.c, track: trackCalls, us: time(R, base, next, SAMPLES)};
+    const c = {...l.c, track: trackCalls};
+    r[k] = {
+      ...c,
+      v: MEM ? (await bytes(R, base, next, SAMPLES)) / 1024 : time(R, base, next, SAMPLES),
+    };
   }
   const f = (x: number) => (x >= 100 ? x.toFixed(0) : x.toFixed(1));
   console.log(
-    `| ${name} | ${r.main.moves} → ${r.pr.moves} | ${r.main.track} → ${r.pr.track} | ${r.main.at} → ${r.pr.at} | ${r.main.update} → ${r.pr.update} | ${r.main.peak} → ${r.pr.peak} | ${f(r.main.us)} → ${f(r.pr.us)} |`,
+    `| ${name} | ${r.main.moves} → ${r.pr.moves} | ${r.main.track} → ${r.pr.track} | ${r.main.at} → ${r.pr.at} | ${r.main.update} → ${r.pr.update} | ${r.main.peak} → ${r.pr.peak} | ${f(r.main.v)} → ${f(r.pr.v)} |`,
   );
 }

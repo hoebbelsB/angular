@@ -1,5 +1,5 @@
 // Serves the main and PR @for bench builds and runs __forBench in headless Chrome over CDP.
-// usage: node run.mjs <n> <rounds> <reps> > out.json   (builds in ./main and ./pr)
+// usage: node run.mjs <n> <rounds> <reps> [time|mem] > out.json   (builds in ./main and ./pr)
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:http';
 import {readFile, stat, mkdtemp} from 'node:fs/promises';
@@ -7,7 +7,12 @@ import {join, extname} from 'node:path';
 import {tmpdir} from 'node:os';
 
 const dir = new URL('.', import.meta.url).pathname;
-const [n = '1000', rounds = '3', reps = '15'] = process.argv.slice(2);
+const [n = '1000', rounds = '3', reps = '15', mode = 'time'] = process.argv.slice(2);
+// mem: precise heap numbers, gc(), and a young generation large enough that no GC runs inside a tick
+const memFlags = [
+  '--enable-precise-memory-info',
+  '--js-flags=--expose-gc --min-semi-space-size=512 --max-semi-space-size=512',
+];
 const builds = ['main', 'pr'];
 const types = {'.js': 'text/javascript', '.html': 'text/html', '.css': 'text/css'};
 const ports = {main: 4311, pr: 4312};
@@ -46,6 +51,7 @@ const chrome = spawn(
     '--disable-renderer-backgrounding',
     '--disable-backgrounding-occluded-windows',
     '--window-size=1280,900',
+    ...(mode === 'mem' ? memFlags : []),
     'about:blank',
   ],
   {stdio: 'ignore'},
@@ -89,13 +95,15 @@ for (let round = 0; round < Number(rounds); round++) {
     await send('Page.navigate', {url: `http://127.0.0.1:${ports[build]}/`});
     for (let i = 0; i < 100 && !(await evaluate('!!window.__forBench')); i++)
       await new Promise((r) => setTimeout(r, 100));
-    const result = await evaluate(`__forBench.runAll(${Number(n)}, ${Number(reps)})`);
+    const result = await evaluate(
+      `__forBench.runAll(${Number(n)}, ${Number(reps)}, ${JSON.stringify(mode)})`,
+    );
     runs.push({build, round, ...result});
     process.stderr.write(`n=${n} round ${round} ${build} done\n`);
   }
 }
 console.log(
-  JSON.stringify({n: Number(n), rounds: Number(rounds), reps: Number(reps), userAgent, runs}),
+  JSON.stringify({n: Number(n), rounds: Number(rounds), reps: Number(reps), mode, userAgent, runs}),
 );
 ws.close();
 chrome.kill();
